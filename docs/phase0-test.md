@@ -12,7 +12,7 @@ Rückweg jederzeit: linke Hälfte wieder mit `2_zmk_links.uf2` flashen.
 ## 1. Flashen (nur linke Hälfte)
 
 1. Kabel an die linke Hälfte, Doppelklick Reset → Laufwerk erscheint.
-2. `4_zmk_links_komotype_TEST.uf2` aus `zmk/firmware/` draufziehen. Warten, bis das Laufwerk verschwindet.
+2. `4_zmk_links_komotype_v<N>.uf2` (highest version) aus `zmk/firmware/` draufziehen. Warten, bis das Laufwerk verschwindet.
 3. Kurz tippen: verhält sich alles wie vorher?
 
 ## 2. Testtool vorbereiten (einmalig)

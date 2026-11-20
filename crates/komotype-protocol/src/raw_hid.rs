@@ -29,6 +29,9 @@ pub struct KeyboardReport {
     /// One entry per split peripheral. `None` = unknown.
     pub battery_peripherals: Vec<Option<u8>>,
     pub uptime_s: u32,
+    /// Version of the komotype ZMK module (1 = layer + battery, 2 = + key statistics).
+    #[serde(default)]
+    pub module_version: u8,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -109,6 +112,8 @@ fn decode_state(data: &[u8]) -> Result<KeyboardReport, DecodeError> {
         battery_central: battery(data[9]),
         battery_peripherals: data[11..11 + count].iter().map(|&b| battery(b)).collect(),
         uptime_s: u32::from_le_bytes([data[15], data[16], data[17], data[18]]),
+        // Module version 1 left this byte 0.
+        module_version: data.get(19).copied().filter(|&v| v > 0).unwrap_or(1),
     })
 }
 

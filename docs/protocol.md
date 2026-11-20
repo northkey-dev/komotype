@@ -26,6 +26,9 @@ Sent 50 ms after a layer or battery change, and as a heartbeat every 5 s.
 | 10 | 1 | number of split peripherals (0 for non-split) |
 | 11 | 4 | peripheral battery % for peripherals 0..3 (`0xFF` = unknown, e.g. never received) |
 | 15 | 4 | keyboard uptime in seconds |
+| 19 | 1 | komotype module version (0 = version 1) |
+
+Module versions: 1 = STATE only (layer, battery). 2 = adds KEYSTATS and HOLDTAP.
 
 ### `0x02` KEYSTATS
 

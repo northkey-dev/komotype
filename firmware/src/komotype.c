@@ -37,6 +37,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #define KT_MAGIC 0x4B /* 'K' */
 #define KT_VERSION 1
+/* Version of this module, reported in STATE. 1 = layer + battery, 2 = + key statistics. */
+#define KT_MODULE_VERSION 2
 
 #define KT_MSG_STATE 0x01
 #define KT_MSG_KEYSTATS 0x02
@@ -122,7 +124,7 @@ static uint8_t peripheral_battery(uint8_t source) {
  *  0 magic 'K' | 1 version | 2 type | 3 seq
  *  4 highest active layer | 5..8 active layer bitmask
  *  9 central battery % | 10 peripheral count | 11..14 peripheral battery %
- * 15..18 uptime in seconds
+ * 15..18 uptime in seconds | 19 module version (0 in module version 1)
  */
 static void send_state(struct k_work *work) {
     uint8_t report[CONFIG_RAW_HID_REPORT_SIZE] = {0};
@@ -136,6 +138,7 @@ static void send_state(struct k_work *work) {
         report[11 + i] = i < KT_PERIPHERAL_COUNT ? peripheral_battery(i) : KT_BATTERY_UNKNOWN;
     }
     sys_put_le32((uint32_t)(k_uptime_get() / 1000), &report[15]);
+    report[19] = KT_MODULE_VERSION;
     send(report);
 
     /* Heartbeat: resend the full state even if nothing changes. */
