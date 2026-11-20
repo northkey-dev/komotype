@@ -26,6 +26,14 @@ New-Item -ItemType Directory -Force $ForkDir | Out-Null
 foreach ($exe in 'komorebi.exe', 'komorebi-bar.exe') {
     $source = Join-Path $release $exe
     if (-not (Test-Path $source)) { throw "$source not found. Build the fork first." }
+    $name = [IO.Path]::GetFileNameWithoutExtension($exe)
+    $running = Get-Process -Name $name -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq (Join-Path $ForkDir $exe) }
+    if ($running) {
+        # Windows locks running executables.
+        Write-Warning "$exe is running from $ForkDir and was not updated. Stop it and run this script again."
+        continue
+    }
     Copy-Item $source $ForkDir -Force
 }
 $script = Join-Path $ForkDir 'start-komorebi.ps1'
