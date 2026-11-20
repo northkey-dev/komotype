@@ -7,7 +7,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::{Local, NaiveDate, TimeZone, Timelike};
-use komotype_protocol::ipc::{Command, FirmwareState, IPC_VERSION, Status, Transport, Typing};
+use komotype_protocol::ipc::{
+    Command, FirmwareState, IPC_VERSION, KeyStats, Status, Transport, Typing,
+};
+use komotype_protocol::raw_hid::Message;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -35,6 +38,8 @@ const WEEK_MS: i64 = 7 * 24 * 3600 * 1000;
 pub enum Event {
     Input(InputEvent),
     Firmware(FirmwareState),
+    /// Key or hold-tap statistics from the firmware.
+    FirmwareStats(Message),
     Command(Command),
 }
 
@@ -51,6 +56,8 @@ struct Day {
     all_keys: u32,
     active_ms: i64,
     best_wpm: Option<f32>,
+    /// Per key position: presses, taps, holds (from the firmware).
+    positions: Vec<[u32; 3]>,
 }
 
 pub struct Engine {
@@ -73,6 +80,10 @@ pub struct Engine {
     rival_wpm_7d: Option<f32>,
     pending_minutes: HashMap<(i64, i64), MinuteCounts>,
     pending_keys: HashMap<(i64, String, u16), u32>,
+    pending_positions: HashMap<(i64, String, u8), [u32; 3]>,
+    /// Stats reports already counted, by (message type, sequence). The keyboard sends each report
+    /// over every connected transport, so USB + Bluetooth deliver it twice.
+    seen_stats: HashMap<(u8, u8), Instant>,
     firmware: HashMap<Transport, (FirmwareState, Instant)>,
     last_flush: Instant,
     last_publish: Instant,
@@ -135,6 +146,8 @@ impl Engine {
             rival_wpm_7d: None,
             pending_minutes: HashMap::new(),
             pending_keys: HashMap::new(),
+            pending_positions: HashMap::new(),
+            seen_stats: HashMap::new(),
             firmware: HashMap::new(),
             last_flush: now,
             last_publish: now,
@@ -207,6 +220,10 @@ impl Engine {
                 }
                 Ok(())
             }
+            Event::FirmwareStats(message) => {
+                self.on_firmware_stats(message);
+                Ok(())
+            }
             Event::Command(Command::Prestige) => {
                 if self.game.prestige(now_ms()) {
                     info!("prestige");
@@ -216,6 +233,45 @@ impl Engine {
                 }
                 Ok(())
             }
+        }
+    }
+
+    fn on_firmware_stats(&mut self, message: Message) {
+        let Some(main) = self.main_db_id else { return };
+        let key = match &message {
+            Message::KeyStats { seq, .. } => (2, *seq),
+            Message::HoldTap { seq, .. } => (3, *seq),
+            Message::State(_) => return,
+        };
+        self.seen_stats
+            .retain(|_, at| at.elapsed() < Duration::from_secs(10));
+        if self.seen_stats.insert(key, Instant::now()).is_some() {
+            return; // same report via the other transport
+        }
+        let day = self.day.date.to_string();
+        let mut add = |position: u8, slot: usize, n: u32| {
+            let i = position as usize;
+            if self.day.positions.len() <= i {
+                self.day.positions.resize(i + 1, [0; 3]);
+            }
+            self.day.positions[i][slot] += n;
+            self.pending_positions
+                .entry((main, day.clone(), position))
+                .or_default()[slot] += n;
+        };
+        match message {
+            Message::KeyStats { presses, .. } => {
+                for (position, n) in presses {
+                    add(position, 0, n as u32);
+                }
+            }
+            Message::HoldTap { outcomes, .. } => {
+                for (position, taps, holds) in outcomes {
+                    add(position, 1, taps as u32);
+                    add(position, 2, holds as u32);
+                }
+            }
+            Message::State(_) => {}
         }
     }
 
@@ -436,12 +492,23 @@ impl Engine {
         let (start_ms, _) = day_bounds(date);
         let min_ms = RECORD_MIN_DURATION.as_millis() as i64;
         let totals = self.db.day_totals(self.main_db_id, start_ms, min_ms)?;
+        let mut positions = Vec::new();
+        if let Some(main) = self.main_db_id {
+            for (position, counts) in self.db.positions(main, &date.to_string())? {
+                let i = position as usize;
+                if positions.len() <= i {
+                    positions.resize(i + 1, [0; 3]);
+                }
+                positions[i] = counts;
+            }
+        }
         self.day = Day {
             date,
             main: totals.main,
             all_keys: totals.all_keys,
             active_ms: totals.active_ms,
             best_wpm: totals.best_wpm,
+            positions,
         };
         self.best_ever = match self.main_db_id {
             Some(id) => self.db.best_wpm(id, None, min_ms)?,
@@ -522,8 +589,15 @@ impl Engine {
     fn flush(&mut self) -> Result<()> {
         self.last_flush = Instant::now();
         self.save_game()?;
-        if self.pending_minutes.is_empty() && self.pending_keys.is_empty() {
+        if self.pending_minutes.is_empty()
+            && self.pending_keys.is_empty()
+            && self.pending_positions.is_empty()
+        {
             return Ok(());
+        }
+        if !self.pending_positions.is_empty() {
+            let positions: Vec<_> = self.pending_positions.drain().collect();
+            self.db.add_positions(&positions)?;
         }
         let minutes: Vec<_> = self.pending_minutes.drain().collect();
         let keys: Vec<_> = self.pending_keys.drain().collect();
@@ -596,6 +670,12 @@ impl Engine {
                 .then(|| day.main.keys as f32 / day.all_keys as f32),
             firmware: self.fresh_firmware().map(|(s, _)| s.clone()),
             game,
+            key_stats: (!day.positions.is_empty()).then(|| KeyStats {
+                presses: day.positions.iter().map(|p| p[0]).collect(),
+                taps: day.positions.iter().map(|p| p[1]).collect(),
+                holds: day.positions.iter().map(|p| p[2]).collect(),
+            }),
+            achievements: None,
         };
         self.status_tx.send_if_modified(|current| {
             if *current == status {

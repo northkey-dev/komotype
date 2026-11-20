@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 pub struct Db {
     conn: Connection,
@@ -53,6 +53,20 @@ impl Db {
             self.conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
                  PRAGMA user_version = 2;",
+            )?;
+        }
+        if version < 3 {
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS position_counts(
+                    device_id INTEGER NOT NULL REFERENCES devices(id),
+                    day TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    presses INTEGER NOT NULL,
+                    taps INTEGER NOT NULL,
+                    holds INTEGER NOT NULL,
+                    PRIMARY KEY(device_id, day, position)
+                 );
+                 PRAGMA user_version = 3;",
             )?;
         }
         Ok(())
@@ -309,5 +323,36 @@ impl Db {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Adds per-position counts (presses, taps, holds) for a day.
+    pub fn add_positions(&mut self, rows: &[((i64, String, u8), [u32; 3])]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO position_counts(device_id, day, position, presses, taps, holds)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(device_id, day, position) DO UPDATE SET
+                    presses = presses + excluded.presses,
+                    taps = taps + excluded.taps,
+                    holds = holds + excluded.holds",
+            )?;
+            for ((device, day, position), [p, t, h]) in rows {
+                stmt.execute(params![device, day, position, p, t, h])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Per-position counts (presses, taps, holds) of a device on a day.
+    pub fn positions(&self, device: i64, day: &str) -> Result<Vec<(u8, [u32; 3])>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT position, presses, taps, holds FROM position_counts WHERE device_id = ?1 AND day = ?2",
+        )?;
+        let rows = stmt.query_map(params![device, day], |r| {
+            Ok((r.get::<_, u8>(0)?, [r.get(1)?, r.get(2)?, r.get(3)?]))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 }

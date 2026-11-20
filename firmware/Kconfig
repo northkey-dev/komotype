@@ -9,6 +9,10 @@ config ZMK_KOMOTYPE_HEARTBEAT_SECONDS
     int "Seconds between full state reports when nothing changes"
     default 5
 
+config ZMK_KOMOTYPE_STATS_SECONDS
+    int "Seconds between key statistics reports while typing"
+    default 2
+
 config ZMK_KOMOTYPE_DEBOUNCE_MS
     int "Delay before sending after a change (merges bursts of changes)"
     default 50

@@ -11,7 +11,7 @@ use crate::raw_hid::KeyboardReport;
 pub const PIPE_NAME: &str = r"\\.\pipe\komotype";
 
 /// Bumped on breaking changes to [`Status`].
-pub const IPC_VERSION: u32 = 2;
+pub const IPC_VERSION: u32 = 3;
 
 /// Client → daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +35,47 @@ pub struct Status {
     pub firmware: Option<FirmwareState>,
     /// Progression: level, streak, quests. `None` until a main keyboard is configured.
     pub game: Option<Game>,
+    /// Today's per-key counts from the firmware module, `None` without module data.
+    pub key_stats: Option<KeyStats>,
+    /// Achievements, `None` until a main keyboard is configured.
+    pub achievements: Option<Achievements>,
+}
+
+/// Counts per physical key position (index = position in the keymap).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct KeyStats {
+    pub presses: Vec<u32>,
+    /// Hold-tap keys only: resolved as tap.
+    pub taps: Vec<u32>,
+    /// Hold-tap keys only: resolved as hold (modifier).
+    pub holds: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rarity {
+    Bronze,
+    Silver,
+    Gold,
+    Legendary,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Achievements {
+    /// Newest first.
+    pub unlocked: Vec<UnlockedAchievement>,
+    /// Rarity of each locked achievement that is not secret. Secret ones are not listed at all.
+    pub locked: Vec<Rarity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnlockedAchievement {
+    pub name: String,
+    pub description: String,
+    pub rarity: Rarity,
+    pub xp: u32,
+    pub secret: bool,
+    pub at_ms: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -129,6 +170,11 @@ pub enum GameEventKind {
     },
     Prestige {
         prestige: u32,
+    },
+    AchievementUnlocked {
+        name: String,
+        rarity: Rarity,
+        xp: u32,
     },
 }
 

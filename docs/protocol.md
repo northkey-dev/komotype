@@ -24,8 +24,32 @@ Sent 50 ms after a layer or battery change, and as a heartbeat every 5 s.
 | 5 | 4 | active layer bitmask (bit n = layer n) |
 | 9 | 1 | central battery % (`0xFF` = unknown) |
 | 10 | 1 | number of split peripherals (0 for non-split) |
-| 11 | 4 | peripheral battery % for peripherals 0..3 (`0xFF` = unknown/not connected) |
+| 11 | 4 | peripheral battery % for peripherals 0..3 (`0xFF` = unknown, e.g. never received) |
 | 15 | 4 | keyboard uptime in seconds |
+
+### `0x02` KEYSTATS
+
+Key presses per physical key position since the previous KEYSTATS report. Sent every 2 s while
+typing (nothing when idle). Several reports if more positions changed than fit into one.
+
+| Offset | Size | Field |
+|---|---|---|
+| 4 | 1 | entry count n |
+| 5 | 2 × n | entries: (position, presses) |
+
+### `0x03` HOLDTAP
+
+Outcome of hold-tap keys (e.g. home row mods) per position since the previous HOLDTAP report.
+The module matches each hold-tap press against the key code that follows: the tap key means tap,
+the hold key means hold.
+
+| Offset | Size | Field |
+|---|---|---|
+| 4 | 1 | entry count n |
+| 5 | 3 × n | entries: (position, taps, holds) |
+
+Note: a keyboard connected over USB and Bluetooth at the same time sends every report on both.
+Hosts should count a KEYSTATS / HOLDTAP report once per sequence number.
 
 ## Host → keyboard
 
@@ -35,4 +59,4 @@ Asks the keyboard to send STATE now (e.g. after the daemon starts). No payload.
 
 ## Status
 
-Version 1 is the phase-0 spike. Key statistics (positions, hold-tap, combos) follow in a later version.
+Version 1. Message types are additive: hosts ignore types they do not know.

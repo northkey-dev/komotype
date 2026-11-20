@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use hidapi::{HidApi, HidDevice};
 use komotype_protocol::ipc::{FirmwareState, Transport};
-use komotype_protocol::raw_hid::{self, REPORT_SIZE};
+use komotype_protocol::raw_hid::{self, Message, REPORT_SIZE};
 use tracing::{debug, info, warn};
 
 use crate::devices::transport_of;
@@ -77,11 +77,14 @@ fn read_loop(device: &HidDevice, transport: Transport, tx: &Sender<Event>) {
         match device.read_timeout(&mut buf, 1000) {
             Ok(0) => continue,
             Ok(n) => match raw_hid::decode(&buf[..n]) {
-                Ok(report) => {
-                    if tx
-                        .send(Event::Firmware(FirmwareState { transport, report }))
-                        .is_err()
-                    {
+                Ok(message) => {
+                    let event = match message {
+                        Message::State(report) => {
+                            Event::Firmware(FirmwareState { transport, report })
+                        }
+                        other => Event::FirmwareStats(other),
+                    };
+                    if tx.send(event).is_err() {
                         return;
                     }
                 }
