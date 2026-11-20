@@ -82,6 +82,16 @@ Add the widget to your `komorebi.bar.json` (all fields except `enable` are optio
 Run `target\release\komorebi-bar.exe --config <your komorebi.bar.json>` instead of the official bar.
 The widget starts `komotyped` automatically (from `PATH` or `daemon_path`).
 
+To start everything at login (fork komorebi, whkd, fork bar), build both and run once:
+
+```
+cargo build --release -p komorebi -p komorebi-bar
+powershell -ExecutionPolicy Bypass -File scripts\install-autostart.ps1 -ForkRepo C:\path\to\komorebi
+```
+
+It copies the binaries to `%LOCALAPPDATA%\komotype\komorebi-fork` (rerun after rebuilding) and adds a
+shortcut to the startup folder. Delete the shortcut to undo.
+
 ### 3. Choose your keyboard
 
 Click the widget → ⚙ tab → **Choose by pressing a key**, then press any key on your keyboard.
