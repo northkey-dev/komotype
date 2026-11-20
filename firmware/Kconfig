@@ -1,0 +1,16 @@
+config ZMK_KOMOTYPE
+    bool "komotype: send keyboard state to the komotype daemon over raw HID"
+    depends on RAW_HID
+    depends on !ZMK_SPLIT || ZMK_SPLIT_ROLE_CENTRAL
+
+if ZMK_KOMOTYPE
+
+config ZMK_KOMOTYPE_HEARTBEAT_SECONDS
+    int "Seconds between full state reports when nothing changes"
+    default 5
+
+config ZMK_KOMOTYPE_DEBOUNCE_MS
+    int "Delay before sending after a change (merges bursts of changes)"
+    default 50
+
+endif
