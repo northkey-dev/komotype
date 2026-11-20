@@ -10,8 +10,17 @@ use crate::devices::DeviceMatcher;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
+    /// Keystrokes per day on the main keyboard that keep the streak alive (default 2000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streak_threshold: Option<u32>,
     /// The keyboard whose typing counts. Set with `komotyped pick`.
     pub main: Option<DeviceMatcher>,
+}
+
+impl Config {
+    pub fn streak_threshold(&self) -> u32 {
+        self.streak_threshold.unwrap_or(2000)
+    }
 }
 
 pub fn path() -> PathBuf {

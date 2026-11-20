@@ -1,19 +1,20 @@
-//! Combines key events and firmware reports into statistics, persists them and publishes
-//! [`Status`] snapshots for IPC clients.
+//! Combines key events and firmware reports into statistics and progression, persists them and
+//! publishes [`Status`] snapshots for IPC clients.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use chrono::{Local, NaiveDate, TimeZone};
-use komotype_protocol::ipc::{FirmwareState, IPC_VERSION, Status, Transport, Typing};
+use chrono::{Local, NaiveDate, TimeZone, Timelike};
+use komotype_protocol::ipc::{Command, FirmwareState, IPC_VERSION, Status, Transport, Typing};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::config::{self, Config};
 use crate::db::{Db, MinuteCounts};
 use crate::devices::{self, DeviceInfo};
+use crate::game::{Baseline, DaySummary, DayView, Game, GameState};
 use crate::input::{DeviceHandle, InputEvent};
 use crate::stats::{Counted, FinishedBurst, KeyFilter, RECORD_MIN_DURATION, Session};
 
@@ -23,14 +24,18 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 const PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 const CONFIG_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 const BATTERY_SAMPLE_INTERVAL: Duration = Duration::from_secs(600);
+const AVERAGES_INTERVAL: Duration = Duration::from_secs(300);
 /// Firmware state older than this is treated as gone (heartbeat is 5 s).
 const FIRMWARE_STALE: Duration = Duration::from_secs(15);
 /// Bursts with fewer characters are noise (e.g. a single shortcut) and are not stored.
 const MIN_BURST_CHARS: u32 = 5;
+const GAME_STATE_KEY: &str = "game";
+const WEEK_MS: i64 = 7 * 24 * 3600 * 1000;
 
 pub enum Event {
     Input(InputEvent),
     Firmware(FirmwareState),
+    Command(Command),
 }
 
 struct Known {
@@ -57,15 +62,22 @@ pub struct Engine {
     attached: HashSet<DeviceHandle>,
     filter: KeyFilter,
     session: Session,
+    /// Typing on other keyboards, to measure the rival's speed.
+    rival_session: Session,
+    rival_db_id: Option<i64>,
     main_db_id: Option<i64>,
     day: Day,
     best_ever: Option<f32>,
+    game: Game,
+    wpm_7d: Option<f32>,
+    rival_wpm_7d: Option<f32>,
     pending_minutes: HashMap<(i64, i64), MinuteCounts>,
     pending_keys: HashMap<(i64, String, u16), u32>,
     firmware: HashMap<Transport, (FirmwareState, Instant)>,
     last_flush: Instant,
     last_publish: Instant,
     last_config_check: Instant,
+    last_averages: Instant,
     last_battery_sample: Option<Instant>,
 }
 
@@ -74,20 +86,36 @@ fn unix_ms(t: SystemTime) -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
-fn current_day() -> (NaiveDate, i64) {
-    let now = Local::now();
-    let date = (now - chrono::Duration::hours(DAY_START_HOUR as i64)).date_naive();
-    let start = date.and_hms_opt(DAY_START_HOUR, 0, 0).expect("valid time");
-    let start_ms = Local
-        .from_local_datetime(&start)
-        .earliest()
-        .map_or_else(|| now.timestamp_millis(), |d| d.timestamp_millis());
-    (date, start_ms)
+fn now_ms() -> i64 {
+    unix_ms(SystemTime::now())
+}
+
+/// Start (inclusive) and end (exclusive) of a typing day, in Unix milliseconds.
+fn day_bounds(date: NaiveDate) -> (i64, i64) {
+    let start_of = |d: NaiveDate| {
+        let t = d.and_hms_opt(DAY_START_HOUR, 0, 0).expect("valid time");
+        Local
+            .from_local_datetime(&t)
+            .earliest()
+            .map_or(0, |d| d.timestamp_millis())
+    };
+    (start_of(date), start_of(date.succ_opt().unwrap_or(date)))
+}
+
+fn current_day() -> NaiveDate {
+    (Local::now() - chrono::Duration::hours(DAY_START_HOUR as i64)).date_naive()
 }
 
 impl Engine {
     pub fn new(db: Db, status_tx: watch::Sender<Status>) -> Result<Self> {
         let now = Instant::now();
+        let game_state = match db.load_value(GAME_STATE_KEY)? {
+            Some(json) => serde_json::from_str::<GameState>(&json).unwrap_or_else(|e| {
+                warn!("game state unreadable, starting fresh: {e}");
+                GameState::default()
+            }),
+            None => GameState::default(),
+        };
         let mut engine = Self {
             db,
             config: config::load()?,
@@ -97,15 +125,21 @@ impl Engine {
             attached: HashSet::new(),
             filter: KeyFilter::default(),
             session: Session::default(),
+            rival_session: Session::default(),
+            rival_db_id: None,
             main_db_id: None,
             day: Day::default(),
             best_ever: None,
+            game: Game::new(game_state),
+            wpm_7d: None,
+            rival_wpm_7d: None,
             pending_minutes: HashMap::new(),
             pending_keys: HashMap::new(),
             firmware: HashMap::new(),
             last_flush: now,
             last_publish: now,
             last_config_check: now,
+            last_averages: now,
             last_battery_sample: None,
         };
         for (handle, info) in devices::list() {
@@ -158,12 +192,27 @@ impl Engine {
             }
             Event::Firmware(state) => {
                 // The keyboard may report over USB and Bluetooth at once. Both carry the same
-                // state; publish right away only when the shown layer changes.
+                // state; react only when the shown layer changes.
                 let layer_before = self.fresh_firmware().map(|(s, _)| s.report.layer);
-                self.firmware.insert(state.transport, (state, Instant::now()));
+                self.firmware
+                    .insert(state.transport, (state, Instant::now()));
                 let layer_after = self.fresh_firmware().map(|(s, _)| s.report.layer);
                 if layer_before != layer_after {
+                    if let Some(layer) = layer_after
+                        && self.main_db_id.is_some()
+                    {
+                        self.game.on_layer(layer, now_ms());
+                    }
                     self.publish();
+                }
+                Ok(())
+            }
+            Event::Command(Command::Prestige) => {
+                if self.game.prestige(now_ms()) {
+                    info!("prestige");
+                    self.publish();
+                } else {
+                    warn!("prestige requested below the maximum level");
                 }
                 Ok(())
             }
@@ -203,7 +252,7 @@ impl Engine {
             self.register(device, info)?;
         }
         let known = &self.known[&device];
-        let (db_id, is_main) = (known.db_id, known.is_main);
+        let (db_id, is_main, identified) = (known.db_id, known.is_main, known.info.vid.is_some());
 
         let wall = SystemTime::now();
         let counts = self
@@ -226,12 +275,27 @@ impl Engine {
             self.main_db_id = Some(db_id);
             self.day.main.keys += 1;
             match counted {
-                Counted::Char => self.day.main.chars += 1,
+                Counted::Char => {
+                    self.day.main.chars += 1;
+                    self.game.on_char(Local::now().hour(), unix_ms(wall));
+                }
                 Counted::Backspace => self.day.main.backspaces += 1,
                 Counted::Other => {}
             }
             if let Some(burst) = self.session.on_key(counted, at, wall) {
                 self.finish_burst(burst)?;
+            }
+        } else if identified && self.main_db_id.is_some() {
+            if self.rival_db_id != Some(db_id) {
+                // Another keyboard took over: close the previous one's burst.
+                if let Some(burst) = self.rival_session.tick(at + Duration::from_secs(3600)) {
+                    self.finish_rival_burst(burst)?;
+                }
+                self.rival_session = Session::default();
+                self.rival_db_id = Some(db_id);
+            }
+            if let Some(burst) = self.rival_session.on_key(counted, at, wall) {
+                self.finish_rival_burst(burst)?;
             }
         }
         Ok(())
@@ -253,16 +317,44 @@ impl Engine {
             burst.backspaces,
         )?;
         self.day.active_ms += duration_ms;
-        if burst.counts_for_records()
-            && let Some(wpm) = burst.wpm()
-        {
+        let record_wpm = burst.counts_for_records().then(|| burst.wpm()).flatten();
+        let at = now_ms();
+        self.game
+            .on_burst(burst.chars, burst.backspaces, record_wpm, at);
+        if let Some(wpm) = record_wpm {
             if self.day.best_wpm.is_none_or(|best| wpm > best) {
                 self.day.best_wpm = Some(wpm);
             }
             if self.best_ever.is_none_or(|best| wpm > best) {
                 info!(wpm, "new personal best");
+                // The very first record is not news.
+                if self.best_ever.is_some() {
+                    self.game.on_new_best(wpm, at);
+                }
                 self.best_ever = Some(wpm);
             }
+            self.refresh_averages()?;
+        }
+        Ok(())
+    }
+
+    fn finish_rival_burst(&mut self, burst: FinishedBurst) -> Result<()> {
+        let Some(device) = self.rival_db_id else {
+            return Ok(());
+        };
+        if burst.chars < MIN_BURST_CHARS {
+            return Ok(());
+        }
+        let duration_ms = burst.duration.as_millis() as i64;
+        self.db.add_burst(
+            device,
+            unix_ms(burst.start_wall),
+            duration_ms,
+            burst.chars,
+            burst.backspaces,
+        )?;
+        if burst.counts_for_records() {
+            self.refresh_averages()?;
         }
         Ok(())
     }
@@ -272,7 +364,10 @@ impl Engine {
         if let Some(burst) = self.session.tick(now) {
             self.finish_burst(burst)?;
         }
-        if current_day().0 != self.day.date {
+        if let Some(burst) = self.rival_session.tick(now) {
+            self.finish_rival_burst(burst)?;
+        }
+        if current_day() != self.day.date {
             info!("new day");
             self.reload_day()?;
         }
@@ -291,6 +386,9 @@ impl Engine {
                 }
             }
         }
+        if now - self.last_averages >= AVERAGES_INTERVAL {
+            self.refresh_averages()?;
+        }
         if now - self.last_flush >= FLUSH_INTERVAL {
             self.flush()?;
         }
@@ -300,11 +398,8 @@ impl Engine {
                 .is_none_or(|t| now - t >= BATTERY_SAMPLE_INTERVAL)
         {
             let peripheral = state.report.battery_peripherals.first().copied().flatten();
-            self.db.add_battery(
-                unix_ms(SystemTime::now()),
-                state.report.battery_central,
-                peripheral,
-            )?;
+            self.db
+                .add_battery(now_ms(), state.report.battery_central, peripheral)?;
             self.last_battery_sample = Some(now);
         }
         if now - self.last_publish >= PUBLISH_INTERVAL {
@@ -331,17 +426,18 @@ impl Engine {
             self.main_db_id = self.db.find_device(m.vid, m.pid, m.product.as_deref())?;
         }
         self.session = Session::default();
+        self.rival_session = Session::default();
         self.reload_day()
     }
 
     fn reload_day(&mut self) -> Result<()> {
         self.flush()?;
-        let (date, start_ms) = current_day();
+        let date = current_day();
+        let (start_ms, _) = day_bounds(date);
         let min_ms = RECORD_MIN_DURATION.as_millis() as i64;
         let totals = self.db.day_totals(self.main_db_id, start_ms, min_ms)?;
         self.day = Day {
             date,
-
             main: totals.main,
             all_keys: totals.all_keys,
             active_ms: totals.active_ms,
@@ -351,11 +447,81 @@ impl Engine {
             Some(id) => self.db.best_wpm(id, None, min_ms)?,
             None => None,
         };
+        self.refresh_averages()?;
+        self.start_game_day()
+    }
+
+    /// Settles past days for streak and loyalty and prepares today's quests.
+    fn start_game_day(&mut self) -> Result<()> {
+        let Some(main) = self.main_db_id else {
+            return Ok(());
+        };
+        let today = self.day.date;
+
+        // Personal baseline for sizing quests: last 7 days with typing.
+        let mut active_days = 0u32;
+        let mut words = 0u32;
+        let mut day = today;
+        for _ in 0..7 {
+            day = day.pred_opt().unwrap_or(day);
+            let (from, to) = day_bounds(day);
+            let (_, _, chars) = self.db.range_keys(Some(main), from, to)?;
+            if chars > 0 {
+                active_days += 1;
+                words += chars / 5;
+            }
+        }
+        let mut baseline = Baseline::default();
+        if active_days > 0 {
+            baseline.words_per_day = words as f32 / active_days as f32;
+        }
+        if let Some(wpm) = self.wpm_7d {
+            baseline.wpm = wpm;
+        }
+
+        let db = &self.db;
+        let history = |d: NaiveDate| {
+            let (from, to) = day_bounds(d);
+            let (main_keys, all_keys, _) = db.range_keys(Some(main), from, to).unwrap_or_default();
+            DaySummary {
+                main_keys,
+                all_keys,
+            }
+        };
+        self.game.start_day(
+            today,
+            history,
+            baseline,
+            self.config.streak_threshold(),
+            now_ms(),
+        );
+        self.save_game()
+    }
+
+    fn refresh_averages(&mut self) -> Result<()> {
+        self.last_averages = Instant::now();
+        let Some(main) = self.main_db_id else {
+            return Ok(());
+        };
+        let since = now_ms() - WEEK_MS;
+        let min_ms = RECORD_MIN_DURATION.as_millis() as i64;
+        self.wpm_7d = self.db.average_wpm(main, false, since, min_ms)?;
+        self.rival_wpm_7d = self.db.average_wpm(main, true, since, min_ms)?;
+        Ok(())
+    }
+
+    fn save_game(&mut self) -> Result<()> {
+        if self.game.dirty {
+            self.db
+                .save_value(GAME_STATE_KEY, &serde_json::to_string(&self.game.state)?)?;
+            self.game.dirty = false;
+        }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
         self.last_flush = Instant::now();
+        self.save_game()?;
         if self.pending_minutes.is_empty() && self.pending_keys.is_empty() {
             return Ok(());
         }
@@ -389,9 +555,24 @@ impl Engine {
     fn publish(&mut self) {
         let now = Instant::now();
         self.last_publish = now;
-        let day = &self.day;
-        let chars = day.main.chars;
+        let chars = self.day.main.chars;
         let live_burst_ms = self.session.active().as_millis() as i64;
+        let active_seconds = ((self.day.active_ms + live_burst_ms) / 1000) as u32;
+        let threshold = self.config.streak_threshold();
+
+        let game = self.main_db_id.map(|_| {
+            let view = DayView {
+                main_chars: chars,
+                main_keys: self.day.main.keys,
+                all_keys: self.day.all_keys,
+                active_seconds,
+            };
+            self.game.update_day(&view, threshold, now_ms());
+            self.game
+                .view(&view, threshold, self.wpm_7d, self.rival_wpm_7d)
+        });
+
+        let day = &self.day;
         let status = Status {
             ipc_version: IPC_VERSION,
             main_keyboard: self.main_name(),
@@ -407,13 +588,14 @@ impl Engine {
                 backspaces_today: day.main.backspaces,
                 accuracy_today: (chars > 0)
                     .then(|| (1.0 - day.main.backspaces as f32 / chars as f32).clamp(0.0, 1.0)),
-                active_seconds_today: ((day.active_ms + live_burst_ms) / 1000) as u32,
+                active_seconds_today: active_seconds,
                 best_wpm_today: day.best_wpm,
                 best_wpm_ever: self.best_ever,
             },
             main_share_today: (day.all_keys > 0)
                 .then(|| day.main.keys as f32 / day.all_keys as f32),
             firmware: self.fresh_firmware().map(|(s, _)| s.clone()),
+            game,
         };
         self.status_tx.send_if_modified(|current| {
             if *current == status {

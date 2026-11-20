@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 pub struct Db {
     conn: Connection,
@@ -46,6 +46,19 @@ impl Db {
         if version >= SCHEMA_VERSION {
             return Ok(());
         }
+        if version < 1 {
+            self.migrate_v1()?;
+        }
+        if version < 2 {
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 PRAGMA user_version = 2;",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn migrate_v1(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS devices(
                 id INTEGER PRIMARY KEY,
@@ -239,5 +252,62 @@ impl Db {
             .optional()?
             .flatten()
             .map(|v| v as f32))
+    }
+
+    /// Keystrokes of the main device and of all devices in `[from_ms, to_ms)`.
+    pub fn range_keys(
+        &self,
+        main: Option<i64>,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<(u32, u32, u32)> {
+        let (from, to) = (from_ms / 60_000, to_ms / 60_000);
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN device_id = ?1 THEN keys END), 0),
+                    COALESCE(SUM(keys), 0),
+                    COALESCE(SUM(CASE WHEN device_id = ?1 THEN chars END), 0)
+             FROM minutes WHERE minute >= ?2 AND minute < ?3",
+            params![main.unwrap_or(-1), from, to],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?)
+    }
+
+    /// Average WPM since `since_ms` over bursts of at least `min_duration_ms`, either of the main
+    /// device (`rival = false`) or of all other devices (`rival = true`).
+    pub fn average_wpm(
+        &self,
+        main: i64,
+        rival: bool,
+        since_ms: i64,
+        min_duration_ms: i64,
+    ) -> Result<Option<f32>> {
+        let sql = if rival {
+            "SELECT SUM(chars) / 5.0 / (SUM(duration_ms) / 60000.0) FROM bursts
+             WHERE device_id != ?1 AND start_ms >= ?2 AND duration_ms >= ?3"
+        } else {
+            "SELECT SUM(chars) / 5.0 / (SUM(duration_ms) / 60000.0) FROM bursts
+             WHERE device_id = ?1 AND start_ms >= ?2 AND duration_ms >= ?3"
+        };
+        Ok(self
+            .conn
+            .query_row(sql, params![main, since_ms, min_duration_ms], |r| {
+                r.get::<_, Option<f64>>(0)
+            })?
+            .map(|v| v as f32))
+    }
+
+    pub fn load_value(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn save_value(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO kv(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 }

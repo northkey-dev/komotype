@@ -1,7 +1,8 @@
 //! IPC between `komotyped` and its clients.
 //!
 //! Transport: named pipe [`PIPE_NAME`], newline-delimited JSON. After connecting, the daemon
-//! sends a [`Status`] line whenever something changes and at least once per second.
+//! sends a [`Status`] line whenever something changes and at least once per second. Clients may
+//! send [`Command`] lines.
 
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +11,15 @@ use crate::raw_hid::KeyboardReport;
 pub const PIPE_NAME: &str = r"\\.\pipe\komotype";
 
 /// Bumped on breaking changes to [`Status`].
-pub const IPC_VERSION: u32 = 1;
+pub const IPC_VERSION: u32 = 2;
+
+/// Client → daemon.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum Command {
+    /// Reset the level to 1 in exchange for a prestige star. Only allowed at the maximum level.
+    Prestige,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Status {
@@ -24,6 +33,103 @@ pub struct Status {
     pub main_share_today: Option<f32>,
     /// Latest state from the komotype firmware module, `None` without module or when stale.
     pub firmware: Option<FirmwareState>,
+    /// Progression: level, streak, quests. `None` until a main keyboard is configured.
+    pub game: Option<Game>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Game {
+    pub level: u32,
+    pub max_level: u32,
+    /// XP earned inside the current level.
+    pub level_xp: u64,
+    /// XP needed to finish the current level (0 at the maximum level).
+    pub level_xp_needed: u64,
+    pub total_xp: u64,
+    pub prestige: u32,
+    /// Rank title for the current level.
+    pub title: String,
+    /// Level at which the next (still secret) title unlocks.
+    pub next_title_level: Option<u32>,
+    /// XP multiplier for staying on the main keyboard (1.0..=2.0).
+    pub loyalty: f32,
+    pub streak_days: u32,
+    pub streak_freezes: u32,
+    /// Keystrokes on the main keyboard today, towards `streak_threshold`.
+    pub streak_today: u32,
+    pub streak_threshold: u32,
+    pub quests: Vec<Quest>,
+    pub weekly: Option<Quest>,
+    /// Season id, e.g. "2026-Q4".
+    pub season: String,
+    pub season_xp: u64,
+    /// Average WPM over the last 7 days (bursts of 30 s or more).
+    pub wpm_7d: Option<f32>,
+    /// Same for all other keyboards: the rival to beat.
+    pub rival_wpm_7d: Option<f32>,
+    /// Most recent first.
+    pub events: Vec<GameEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Quest {
+    /// May contain `{layer}`, to be replaced with the name of [`Quest::layer`].
+    pub title: String,
+    pub layer: Option<u8>,
+    pub progress: u32,
+    pub target: u32,
+    pub reward_xp: u32,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GameEvent {
+    /// Unix time in milliseconds.
+    pub at_ms: i64,
+    pub kind: GameEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GameEventKind {
+    LevelUp {
+        level: u32,
+    },
+    TitleUnlocked {
+        title: String,
+    },
+    QuestCompleted {
+        title: String,
+        layer: Option<u8>,
+        xp: u32,
+    },
+    WeeklyCompleted {
+        title: String,
+        xp: u32,
+    },
+    StreakExtended {
+        days: u32,
+        xp: u32,
+    },
+    StreakFrozen {
+        days: u32,
+    },
+    StreakLost {
+        days: u32,
+    },
+    LoyaltyChanged {
+        from: f32,
+        to: f32,
+    },
+    NewBestWpm {
+        wpm: f32,
+    },
+    SeasonStarted {
+        season: String,
+    },
+    Prestige {
+        prestige: u32,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

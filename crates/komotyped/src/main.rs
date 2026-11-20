@@ -5,6 +5,7 @@ mod db;
 mod devices;
 mod engine;
 mod firmware;
+mod game;
 mod input;
 mod ipc;
 mod stats;
@@ -81,13 +82,13 @@ fn run() -> Result<()> {
 
         let (tx, rx) = mpsc::channel();
         input::spawn(tx.clone())?;
-        firmware::spawn(tx);
+        firmware::spawn(tx.clone());
         std::thread::Builder::new()
             .name("engine".into())
             .spawn(move || engine.run(rx))?;
 
         info!(config = %config::path().display(), "komotyped running");
-        ipc::serve(server, status_rx).await
+        ipc::serve(server, status_rx, tx).await
     })
 }
 
