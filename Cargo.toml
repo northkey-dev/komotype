@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["crates/komotype-protocol", "crates/komotyped"]
+
+[profile.release]
+lto = true
+codegen-units = 1

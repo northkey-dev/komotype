@@ -19,6 +19,20 @@ A gamified typing tracker for Windows, built for the [komorebi](https://github.c
 | ZMK module (raw HID) | this repo (`firmware/`) |
 | komorebi-bar widget | [northkey-dev/komorebi](https://github.com/northkey-dev/komorebi) (fork) |
 
+## Try the daemon (work in progress)
+
+Requires Rust (stable, MSVC toolchain).
+
+```
+cargo build --release
+target\release\komotyped.exe pick          # press a key on your main keyboard
+target\release\komotyped.exe               # run the daemon
+target\release\komotyped.exe status --watch
+```
+
+Config: `%USERPROFILE%\.config\komotype\config.toml` · Data: `%LOCALAPPDATA%\komotype\komotype.db`.
+Only counts are stored, never what you type.
+
 ## Credits
 
 komotype would not exist without these projects:
