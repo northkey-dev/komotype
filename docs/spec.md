@@ -174,9 +174,9 @@ Bar blinkt kurz in Seltenheitsfarbe + Windows-Toast (vom Daemon, funktioniert au
 |---|---|---|
 | 0 ✅ | **Spike:** minimales ZMK-Modul sendet Layer + Akku über raw-hid; Test-CLI liest über USB **und BLE** | Machbarkeit geklärt |
 | 1 ✅ | Daemon-Kern: Raw Input, Gerätewahl, WPM/Genauigkeit, SQLite, IPC (+ Firmware-Daten) | Zahlen im Terminal |
-| 2 | Widget im Fork: Bar-Text, Hover, Popup-Stats | sichtbar in der Bar |
+| 2 ✅ | Widget im Fork: Bar-Text, Hover, Popup-Stats | sichtbar in der Bar |
 | 3 | Firmware-Modul komplett + Anbindung (Layer, Akku, Heatmap, HRM, Combos) | Firmware-Daten in der Bar |
-| 4 | Game-Engine: XP, Level, Treue, Rivale, Streak, Tages-/Wochenquests, Saisons, Prestige | spielbar |
+| 4 ✅ | Game-Engine: XP, Level, Treue, Rivale, Streak, Tages-/Wochenquests, Saisons, Prestige | spielbar |
 | 5 | Achievements (verdeckt) + Toasts | Belohnungen |
 | 6 | Polishing für andere: README, Releases, Gerätewahl-UI | teilbar |
 | – | Fork-Extra „Layout merken“ (Abschnitt 9), unabhängig, jederzeit einschiebbar | Layout überlebt Neustart |
