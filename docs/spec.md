@@ -178,7 +178,7 @@ Bar blinkt kurz in Seltenheitsfarbe + Windows-Toast (vom Daemon, funktioniert au
 | 3 ✅ | Firmware-Modul komplett + Anbindung (Layer, Akku, Heatmap, HRM; keine Combos in der Cornix-Keymap) | Firmware-Daten in der Bar |
 | 4 ✅ | Game-Engine: XP, Level, Treue, Rivale, Streak, Tages-/Wochenquests, Saisons, Prestige | spielbar |
 | 5 ✅ | Achievements (verdeckt) + Toasts | Belohnungen |
-| 6 | Polishing für andere: README, Releases, Gerätewahl-UI | teilbar |
+| 6 ✅ | Polishing für andere: README, Releases, Gerätewahl-UI | teilbar |
 | – | Fork-Extra „Layout merken“ (Abschnitt 9), unabhängig, jederzeit einschiebbar | Layout überlebt Neustart |
 
 ## 8. Fork-Extra: Layout merken

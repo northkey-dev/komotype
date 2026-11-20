@@ -1,0 +1,27 @@
+name: Release
+
+# Push a tag like v0.1.0 to publish komotyped.exe.
+# Only the daemon is released as a binary; the komorebi-bar fork must be built from source
+# (Komorebi License).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+      - run: cargo build --release -p komotyped
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" target/release/komotyped.exe \
+            --title "komotype $GITHUB_REF_NAME" --generate-notes
