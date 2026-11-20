@@ -19,6 +19,9 @@ pub struct MinuteCounts {
     pub keys: u32,
 }
 
+/// ((device, day, position), [presses, taps, holds])
+pub type PositionRow = ((i64, String, u8), [u32; 3]);
+
 #[derive(Debug, Default)]
 pub struct DayTotals {
     pub main: MinuteCounts,
@@ -326,7 +329,7 @@ impl Db {
     }
 
     /// Adds per-position counts (presses, taps, holds) for a day.
-    pub fn add_positions(&mut self, rows: &[((i64, String, u8), [u32; 3])]) -> Result<()> {
+    pub fn add_positions(&mut self, rows: &[PositionRow]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
@@ -353,6 +356,46 @@ impl Db {
         let rows = stmt.query_map(params![device, day], |r| {
             Ok((r.get::<_, u8>(0)?, [r.get(1)?, r.get(2)?, r.get(3)?]))
         })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Lifetime totals of a device: (chars, keys, backspaces, taps, holds).
+    pub fn lifetime(&self, device: i64) -> Result<(u64, u64, u64, u64, u64)> {
+        let (chars, keys, backspaces) = self.conn.query_row(
+            "SELECT COALESCE(SUM(chars), 0), COALESCE(SUM(keys), 0), COALESCE(SUM(backspaces), 0)
+             FROM minutes WHERE device_id = ?1",
+            [device],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                ))
+            },
+        )?;
+        let (taps, holds) = self.conn.query_row(
+            "SELECT COALESCE(SUM(taps), 0), COALESCE(SUM(holds), 0) FROM position_counts WHERE device_id = ?1",
+            [device],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+        )?;
+        Ok((chars, keys, backspaces, taps, holds))
+    }
+
+    /// (minute, chars) of a device since `from_minute`.
+    pub fn minute_chars(&self, device: i64, from_minute: i64) -> Result<Vec<(i64, u32)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT minute, chars FROM minutes WHERE device_id = ?1 AND minute >= ?2")?;
+        let rows = stmt.query_map(params![device, from_minute], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// (virtual key, presses) of a device on a day.
+    pub fn vkeys(&self, device: i64, day: &str) -> Result<Vec<(u16, u32)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT vkey, count FROM key_counts WHERE device_id = ?1 AND day = ?2")?;
+        let rows = stmt.query_map(params![device, day], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 }

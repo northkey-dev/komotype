@@ -13,6 +13,7 @@ komotype-protocol = { version = "0.1.0", path = "../komotype-protocol" }
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+tauri-winrt-notification = "0.8.1"
 tokio = { version = "1.54.1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
 toml = "1.2.1"
 tracing = "0.1.44"

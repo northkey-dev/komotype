@@ -15,6 +15,39 @@ pub struct Config {
     pub streak_threshold: Option<u32>,
     /// The keyboard whose typing counts. Set with `komotyped pick`.
     pub main: Option<DeviceMatcher>,
+    /// Which events show a Windows notification.
+    #[serde(default)]
+    pub notifications: Notifications,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Notifications {
+    pub enabled: bool,
+    pub achievements: bool,
+    /// New rank titles and prestige.
+    pub titles: bool,
+    /// New personal best WPM.
+    pub records: bool,
+    pub weekly: bool,
+    /// Streak lost or saved by a freeze.
+    pub streak: bool,
+    /// Daily quests (the bar already announces them).
+    pub quests: bool,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            achievements: true,
+            titles: true,
+            records: true,
+            weekly: true,
+            streak: true,
+            quests: false,
+        }
+    }
 }
 
 impl Config {

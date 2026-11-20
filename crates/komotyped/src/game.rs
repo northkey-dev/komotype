@@ -240,6 +240,7 @@ fn day_seed(date: NaiveDate) -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GameState {
     total_xp: f64,
     prestige: u32,
@@ -258,6 +259,35 @@ pub struct GameState {
     season_xp: f64,
     layers_seen: BTreeSet<u8>,
     events: VecDeque<GameEvent>,
+    // Lifetime counters (for achievements).
+    quests_completed: u32,
+    weekly_completed: u32,
+    perfect_quest_days: u32,
+    max_streak: u32,
+    days_active: u32,
+    first_day: Option<NaiveDate>,
+    seasons_played: u32,
+    last_active_day: Option<NaiveDate>,
+    /// Days without typing before today (0 if you typed yesterday).
+    idle_return_days: u32,
+}
+
+/// Lifetime counters exposed to achievements.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Counters {
+    pub level: u32,
+    pub prestige: u32,
+    pub loyalty: f32,
+    pub streak: u32,
+    pub max_streak: u32,
+    pub days_active: u32,
+    pub days_since_start: u32,
+    pub idle_return_days: u32,
+    pub quests_completed: u32,
+    pub weekly_completed: u32,
+    pub perfect_quest_days: u32,
+    pub season_xp: u64,
+    pub seasons_played: u32,
 }
 
 impl Default for GameState {
@@ -280,6 +310,15 @@ impl Default for GameState {
             season_xp: 0.0,
             layers_seen: BTreeSet::new(),
             events: VecDeque::new(),
+            quests_completed: 0,
+            weekly_completed: 0,
+            perfect_quest_days: 0,
+            max_streak: 0,
+            days_active: 0,
+            first_day: None,
+            seasons_played: 0,
+            last_active_day: None,
+            idle_return_days: 0,
         }
     }
 }
@@ -408,6 +447,50 @@ impl Game {
         self.check_quests(at_ms);
     }
 
+    pub fn newest_event_ms(&self) -> Option<i64> {
+        self.state.events.front().map(|e| e.at_ms)
+    }
+
+    /// Events newer than `since_ms`, oldest first.
+    pub fn events_since(&self, since_ms: i64) -> Vec<GameEvent> {
+        let mut events: Vec<GameEvent> = self
+            .state
+            .events
+            .iter()
+            .filter(|e| e.at_ms > since_ms)
+            .cloned()
+            .collect();
+        events.reverse();
+        events
+    }
+
+    /// Announces a reward from outside the game logic (achievements) and grants its XP.
+    pub fn award(&mut self, xp: u32, kind: GameEventKind, at_ms: i64) {
+        self.push(at_ms, kind);
+        self.add_xp(xp as f64, at_ms);
+    }
+
+    pub fn counters(&self, today: NaiveDate) -> Counters {
+        let s = &self.state;
+        Counters {
+            level: self.level(),
+            prestige: s.prestige,
+            loyalty: s.loyalty,
+            streak: s.streak,
+            max_streak: s.max_streak.max(s.streak),
+            days_active: s.days_active,
+            days_since_start: s
+                .first_day
+                .map_or(0, |d| (today - d).num_days().max(0) as u32),
+            idle_return_days: s.idle_return_days,
+            quests_completed: s.quests_completed,
+            weekly_completed: s.weekly_completed,
+            perfect_quest_days: s.perfect_quest_days,
+            season_xp: s.season_xp as u64,
+            seasons_played: s.seasons_played,
+        }
+    }
+
     pub fn on_new_best(&mut self, wpm: f32, at_ms: i64) {
         self.push(at_ms, GameEventKind::NewBestWpm { wpm });
     }
@@ -442,9 +525,12 @@ impl Game {
     fn check_quests(&mut self, at_ms: i64) {
         let scale = self.reward_scale();
         let mut rewards = Vec::new();
+        let all_done_before =
+            !self.state.quests.is_empty() && self.state.quests.iter().all(|q| q.done);
         for q in &mut self.state.quests {
             if !q.done && q.is_complete() {
                 q.done = true;
+                self.state.quests_completed += 1;
                 let xp = (q.reward as f32 * scale).round() as u32;
                 rewards.push(GameEventKind::QuestCompleted {
                     title: q.title(),
@@ -458,11 +544,18 @@ impl Game {
             && q.is_complete()
         {
             q.done = true;
+            self.state.weekly_completed += 1;
             let xp = (q.reward as f32 * scale).round() as u32;
             rewards.push(GameEventKind::WeeklyCompleted {
                 title: q.title(),
                 xp,
             });
+        }
+        if !all_done_before
+            && !self.state.quests.is_empty()
+            && self.state.quests.iter().all(|q| q.done)
+        {
+            self.state.perfect_quest_days += 1;
         }
         for kind in rewards {
             let xp = match &kind {
@@ -498,13 +591,23 @@ impl Game {
                 settling_week = Some(week_start(day));
                 self.state.week_goal_days = 0;
             }
-            self.settle_day(history(day), streak_threshold, at_ms);
+            self.settle_day(day, history(day), streak_threshold, at_ms);
             day = day.succ_opt().unwrap_or(day);
         }
         self.state.last_evaluated = Some(yesterday);
 
+        if self.state.first_day.is_none() {
+            self.state.first_day = Some(today);
+        }
+        if self.state.quest_day != Some(today) {
+            self.state.idle_return_days = self.state.last_active_day.map_or(0, |d| {
+                (today - d).num_days().saturating_sub(1).max(0) as u32
+            });
+        }
+
         let season = season_of(today);
         if self.state.season != season {
+            self.state.seasons_played += 1;
             if !self.state.season.is_empty() {
                 self.push(
                     at_ms,
@@ -535,10 +638,15 @@ impl Game {
         self.dirty = true;
     }
 
-    fn settle_day(&mut self, day: DaySummary, threshold: u32, at_ms: i64) {
+    fn settle_day(&mut self, date: NaiveDate, day: DaySummary, threshold: u32, at_ms: i64) {
         let s = &mut self.state;
+        if day.main_keys >= 1000 {
+            s.days_active += 1;
+            s.last_active_day = Some(date);
+        }
         if day.main_keys >= threshold {
             s.streak += 1;
+            s.max_streak = s.max_streak.max(s.streak);
             s.week_goal_days += 1;
             s.days_toward_freeze += 1;
             if s.days_toward_freeze >= FREEZE_EVERY_DAYS {

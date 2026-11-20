@@ -1,24 +1,28 @@
 //! Combines key events and firmware reports into statistics and progression, persists them and
 //! publishes [`Status`] snapshots for IPC clients.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use chrono::{Local, NaiveDate, TimeZone, Timelike};
+use chrono::{Datelike, Local, NaiveDate, TimeZone, Timelike};
 use komotype_protocol::ipc::{
-    Command, FirmwareState, IPC_VERSION, KeyStats, Status, Transport, Typing,
+    Command, FirmwareState, GameEventKind, IPC_VERSION, KeyStats, Status, Transport, Typing,
 };
 use komotype_protocol::raw_hid::Message;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{info, warn};
+
+use crate::achievements::{self, Book, Snapshot};
 
 use crate::config::{self, Config};
 use crate::db::{Db, MinuteCounts};
 use crate::devices::{self, DeviceInfo};
 use crate::game::{Baseline, DaySummary, DayView, Game, GameState};
 use crate::input::{DeviceHandle, InputEvent};
+use crate::notify;
 use crate::stats::{Counted, FinishedBurst, KeyFilter, RECORD_MIN_DURATION, Session};
 
 /// The typing day starts at 04:00 local time, so late-night sessions count for the evening.
@@ -33,6 +37,8 @@ const FIRMWARE_STALE: Duration = Duration::from_secs(15);
 /// Bursts with fewer characters are noise (e.g. a single shortcut) and are not stored.
 const MIN_BURST_CHARS: u32 = 5;
 const GAME_STATE_KEY: &str = "game";
+const ACHIEVEMENTS_KEY: &str = "achievements";
+const METRICS_KEY: &str = "metrics";
 const WEEK_MS: i64 = 7 * 24 * 3600 * 1000;
 
 pub enum Event {
@@ -58,6 +64,41 @@ struct Day {
     best_wpm: Option<f32>,
     /// Per key position: presses, taps, holds (from the firmware).
     positions: Vec<[u32; 3]>,
+    /// Characters per local hour on the main keyboard.
+    hour_chars: [u32; 24],
+    /// Non-base layers used today.
+    layers: BTreeSet<u8>,
+    /// Presses per virtual key on the main keyboard.
+    vkeys: HashMap<u16, u32>,
+}
+
+/// Lifetime totals of the main keyboard, loaded from the database and counted on.
+#[derive(Default)]
+struct Lifetime {
+    chars: u64,
+    keys: u64,
+    backspaces: u64,
+    taps: u64,
+    holds: u64,
+}
+
+/// Counters that are not derivable from stored statistics.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Extra {
+    perfect_bursts: u64,
+    layer_switches: u64,
+    new_bests: u64,
+}
+
+#[derive(Default, Clone, Copy)]
+struct LastBurst {
+    /// Only bursts of 30 s or more, else 0.
+    wpm: f32,
+    chars: u32,
+    /// Only bursts of 200+ characters, else 0.
+    accuracy: f32,
+    minutes: f32,
 }
 
 pub struct Engine {
@@ -76,6 +117,12 @@ pub struct Engine {
     day: Day,
     best_ever: Option<f32>,
     game: Game,
+    book: Book,
+    lifetime: Lifetime,
+    extra: Extra,
+    last_burst: LastBurst,
+    /// Game events up to this time were already considered for notifications.
+    last_toast_ms: i64,
     wpm_7d: Option<f32>,
     rival_wpm_7d: Option<f32>,
     pending_minutes: HashMap<(i64, i64), MinuteCounts>,
@@ -127,6 +174,14 @@ impl Engine {
             }),
             None => GameState::default(),
         };
+        let unlocked: HashMap<String, i64> = db
+            .load_value(ACHIEVEMENTS_KEY)?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        let extra: Extra = db
+            .load_value(METRICS_KEY)?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
         let mut engine = Self {
             db,
             config: config::load()?,
@@ -142,6 +197,11 @@ impl Engine {
             day: Day::default(),
             best_ever: None,
             game: Game::new(game_state),
+            book: Book::new(achievements::builtin(), unlocked),
+            lifetime: Lifetime::default(),
+            extra,
+            last_burst: LastBurst::default(),
+            last_toast_ms: now_ms(),
             wpm_7d: None,
             rival_wpm_7d: None,
             pending_minutes: HashMap::new(),
@@ -215,6 +275,10 @@ impl Engine {
                         && self.main_db_id.is_some()
                     {
                         self.game.on_layer(layer, now_ms());
+                        if layer != 0 {
+                            self.extra.layer_switches += 1;
+                            self.day.layers.insert(layer);
+                        }
                     }
                     self.publish();
                 }
@@ -269,6 +333,8 @@ impl Engine {
                 for (position, taps, holds) in outcomes {
                     add(position, 1, taps as u32);
                     add(position, 2, holds as u32);
+                    self.lifetime.taps += taps as u64;
+                    self.lifetime.holds += holds as u64;
                 }
             }
             Message::State(_) => {}
@@ -330,12 +396,20 @@ impl Engine {
         if is_main {
             self.main_db_id = Some(db_id);
             self.day.main.keys += 1;
+            self.lifetime.keys += 1;
+            *self.day.vkeys.entry(vkey).or_default() += 1;
             match counted {
                 Counted::Char => {
+                    let hour = Local::now().hour();
                     self.day.main.chars += 1;
-                    self.game.on_char(Local::now().hour(), unix_ms(wall));
+                    self.day.hour_chars[hour as usize] += 1;
+                    self.lifetime.chars += 1;
+                    self.game.on_char(hour, unix_ms(wall));
                 }
-                Counted::Backspace => self.day.main.backspaces += 1,
+                Counted::Backspace => {
+                    self.day.main.backspaces += 1;
+                    self.lifetime.backspaces += 1;
+                }
                 Counted::Other => {}
             }
             if let Some(burst) = self.session.on_key(counted, at, wall) {
@@ -375,6 +449,19 @@ impl Engine {
         self.day.active_ms += duration_ms;
         let record_wpm = burst.counts_for_records().then(|| burst.wpm()).flatten();
         let at = now_ms();
+        self.last_burst = LastBurst {
+            wpm: record_wpm.unwrap_or(0.0),
+            chars: burst.chars,
+            accuracy: if burst.chars >= 200 {
+                1.0 - burst.backspaces as f32 / burst.chars as f32
+            } else {
+                0.0
+            },
+            minutes: burst.duration.as_secs_f32() / 60.0,
+        };
+        if burst.chars >= 100 && burst.backspaces == 0 {
+            self.extra.perfect_bursts += 1;
+        }
         self.game
             .on_burst(burst.chars, burst.backspaces, record_wpm, at);
         if let Some(wpm) = record_wpm {
@@ -386,6 +473,7 @@ impl Engine {
                 // The very first record is not news.
                 if self.best_ever.is_some() {
                     self.game.on_new_best(wpm, at);
+                    self.extra.new_bests += 1;
                 }
                 self.best_ever = Some(wpm);
             }
@@ -493,7 +581,28 @@ impl Engine {
         let min_ms = RECORD_MIN_DURATION.as_millis() as i64;
         let totals = self.db.day_totals(self.main_db_id, start_ms, min_ms)?;
         let mut positions = Vec::new();
+        let mut hour_chars = [0u32; 24];
+        let mut vkeys = HashMap::new();
+        self.lifetime = Lifetime::default();
         if let Some(main) = self.main_db_id {
+            let (chars, keys, backspaces, taps, holds) = self.db.lifetime(main)?;
+            self.lifetime = Lifetime {
+                chars,
+                keys,
+                backspaces,
+                taps,
+                holds,
+            };
+            for (minute, n) in self.db.minute_chars(main, start_ms / 60_000)? {
+                if let Some(t) = Local.timestamp_opt(minute * 60, 0).single() {
+                    hour_chars[t.hour() as usize] += n;
+                }
+            }
+            vkeys = self
+                .db
+                .vkeys(main, &date.to_string())?
+                .into_iter()
+                .collect();
             for (position, counts) in self.db.positions(main, &date.to_string())? {
                 let i = position as usize;
                 if positions.len() <= i {
@@ -509,6 +618,9 @@ impl Engine {
             active_ms: totals.active_ms,
             best_wpm: totals.best_wpm,
             positions,
+            hour_chars,
+            layers: BTreeSet::new(),
+            vkeys,
         };
         self.best_ever = match self.main_db_id {
             Some(id) => self.db.best_wpm(id, None, min_ms)?,
@@ -583,6 +695,13 @@ impl Engine {
                 .save_value(GAME_STATE_KEY, &serde_json::to_string(&self.game.state)?)?;
             self.game.dirty = false;
         }
+        if self.book.dirty {
+            let json = serde_json::to_string(self.book.unlocked_ids())?;
+            self.db.save_value(ACHIEVEMENTS_KEY, &json)?;
+            self.book.dirty = false;
+        }
+        self.db
+            .save_value(METRICS_KEY, &serde_json::to_string(&self.extra)?)?;
         Ok(())
     }
 
@@ -626,6 +745,184 @@ impl Engine {
         )
     }
 
+    /// All values achievements can be checked against, at this moment.
+    fn snapshot(&self, now: Instant, active_seconds: u32) -> Snapshot {
+        let day = &self.day;
+        let c = self.game.counters(day.date);
+        let local = Local::now();
+        let chars = day.main.chars as f64;
+        let firmware = self.fresh_firmware().map(|(s, _)| s);
+        let batteries: Vec<f64> = firmware
+            .map(|f| {
+                std::iter::once(f.report.battery_central)
+                    .chain(f.report.battery_peripherals.iter().copied())
+                    .flatten()
+                    .map(f64::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let on_bluetooth = firmware.is_some_and(|f| f.transport == Transport::Bluetooth);
+        let mut v: HashMap<&'static str, f64> = HashMap::from([
+            ("lifetime_words", self.lifetime.chars as f64 / 5.0),
+            ("lifetime_keys", self.lifetime.keys as f64),
+            ("lifetime_backspaces", self.lifetime.backspaces as f64),
+            ("perfect_bursts", self.extra.perfect_bursts as f64),
+            ("layer_switches", self.extra.layer_switches as f64),
+            ("hrm_holds", self.lifetime.holds as f64),
+            ("hrm_taps", self.lifetime.taps as f64),
+            ("today_words", chars / 5.0),
+            ("today_keys", day.main.keys as f64),
+            ("today_backspaces", day.main.backspaces as f64),
+            ("today_active_minutes", active_seconds as f64 / 60.0),
+            // Accuracy and share only count on real typing days, not after three keystrokes.
+            (
+                "today_accuracy",
+                if chars >= 2500.0 {
+                    (1.0 - day.main.backspaces as f64 / chars).max(0.0)
+                } else {
+                    0.0
+                },
+            ),
+            (
+                "today_share",
+                if day.main.keys >= 1000 && day.all_keys > 0 {
+                    day.main.keys as f64 / day.all_keys as f64
+                } else {
+                    0.0
+                },
+            ),
+            ("today_layers", day.layers.len() as f64),
+            (
+                "today_hrm_holds",
+                day.positions.iter().map(|p| p[2] as f64).sum(),
+            ),
+            (
+                "today_max_key",
+                day.positions.iter().map(|p| p[0]).max().unwrap_or(0) as f64,
+            ),
+            (
+                "today_distinct_keys",
+                day.positions.iter().filter(|p| p[0] > 0).count() as f64,
+            ),
+            ("burst_wpm", self.last_burst.wpm as f64),
+            ("burst_chars", self.last_burst.chars as f64),
+            ("burst_accuracy", self.last_burst.accuracy as f64),
+            ("burst_minutes", self.last_burst.minutes as f64),
+            ("best_wpm", self.best_ever.unwrap_or(0.0) as f64),
+            ("new_bests", self.extra.new_bests as f64),
+            ("wpm_live", self.session.wpm_live(now) as f64),
+            ("level", c.level as f64),
+            ("prestige", c.prestige as f64),
+            ("loyalty", c.loyalty as f64),
+            ("streak_days", c.streak as f64),
+            ("max_streak", c.max_streak as f64),
+            ("days_active", c.days_active as f64),
+            ("days_since_start", c.days_since_start as f64),
+            ("idle_return_days", c.idle_return_days as f64),
+            ("quests_completed", c.quests_completed as f64),
+            ("weekly_completed", c.weekly_completed as f64),
+            ("perfect_quest_days", c.perfect_quest_days as f64),
+            ("season_xp", c.season_xp as f64),
+            ("seasons_played", c.seasons_played as f64),
+            ("achievements_unlocked", self.book.unlocked_count() as f64),
+            ("on_bluetooth", if on_bluetooth { 1.0 } else { 0.0 }),
+            ("month", local.month() as f64),
+            ("day_of_month", local.day() as f64),
+            ("weekday", local.weekday().number_from_monday() as f64),
+            ("hour", local.hour() as f64),
+        ]);
+        if let (Some(me), Some(rival)) = (self.wpm_7d, self.rival_wpm_7d) {
+            v.insert("rival_gap", (me - rival) as f64);
+        }
+        if !batteries.is_empty() {
+            v.insert(
+                "battery_min",
+                batteries.iter().copied().fold(f64::MAX, f64::min),
+            );
+            v.insert("battery_max", batteries.iter().copied().fold(0.0, f64::max));
+        }
+        if let Some(f) = firmware {
+            v.insert("keyboard_uptime_hours", f.report.uptime_s as f64 / 3600.0);
+        }
+        Snapshot {
+            scalars: v,
+            hour_chars: day.hour_chars,
+            vkeys: day.vkeys.clone(),
+        }
+    }
+
+    fn check_achievements(&mut self, now: Instant, active_seconds: u32) {
+        let snapshot = self.snapshot(now, active_seconds);
+        let at = now_ms();
+        for def in self.book.check(&snapshot, at) {
+            info!(rarity = ?def.rarity, "achievement unlocked");
+            let xp = achievements::xp_for(def.rarity);
+            self.game.award(
+                xp,
+                GameEventKind::AchievementUnlocked {
+                    name: def.name,
+                    rarity: def.rarity,
+                    xp,
+                },
+                at,
+            );
+        }
+    }
+
+    /// Shows Windows notifications for new game events, as configured.
+    fn notify_events(&mut self) {
+        let Some(newest) = self.game.newest_event_ms() else {
+            return;
+        };
+        if newest <= self.last_toast_ms {
+            return;
+        }
+        let since = self.last_toast_ms;
+        self.last_toast_ms = newest;
+        let n = &self.config.notifications;
+        if !n.enabled {
+            return;
+        }
+        for event in self.game.events_since(since) {
+            let toast = match &event.kind {
+                GameEventKind::AchievementUnlocked { name, rarity, xp } if n.achievements => {
+                    Some((
+                        format!("Achievement unlocked: {name}"),
+                        format!("{rarity:?} · +{xp} XP"),
+                    ))
+                }
+                GameEventKind::TitleUnlocked { title } if n.titles => {
+                    Some(("New title".into(), title.clone()))
+                }
+                GameEventKind::Prestige { prestige } if n.titles => {
+                    Some(("Prestige!".into(), format!("Prestige {prestige} reached")))
+                }
+                GameEventKind::NewBestWpm { wpm } if n.records => {
+                    Some(("New personal best".into(), format!("{wpm:.0} WPM")))
+                }
+                GameEventKind::WeeklyCompleted { title, xp } if n.weekly => Some((
+                    "Weekly challenge done".into(),
+                    format!("{title} · +{xp} XP"),
+                )),
+                GameEventKind::StreakLost { days } if n.streak => Some((
+                    "Streak lost".into(),
+                    format!("Your {days}-day streak ended"),
+                )),
+                GameEventKind::StreakFrozen { days } if n.streak => Some((
+                    "Streak saved".into(),
+                    format!("A freeze kept your {days}-day streak"),
+                )),
+                GameEventKind::QuestCompleted { title, xp, .. } if n.quests => {
+                    Some(("Quest done".into(), format!("{title} · +{xp} XP")))
+                }
+                _ => None,
+            };
+            if let Some((title, body)) = toast {
+                notify::show(format!("komotype · {title}"), body);
+            }
+        }
+    }
+
     fn publish(&mut self) {
         let now = Instant::now();
         self.last_publish = now;
@@ -642,6 +939,8 @@ impl Engine {
                 active_seconds,
             };
             self.game.update_day(&view, threshold, now_ms());
+            self.check_achievements(now, active_seconds);
+            self.notify_events();
             self.game
                 .view(&view, threshold, self.wpm_7d, self.rival_wpm_7d)
         });
@@ -675,7 +974,7 @@ impl Engine {
                 taps: day.positions.iter().map(|p| p[1]).collect(),
                 holds: day.positions.iter().map(|p| p[2]).collect(),
             }),
-            achievements: None,
+            achievements: self.main_db_id.map(|_| self.book.view()),
         };
         self.status_tx.send_if_modified(|current| {
             if *current == status {

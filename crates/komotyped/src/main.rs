@@ -1,5 +1,6 @@
 //! komotyped: background daemon of komotype, the gamified typing tracker for komorebi-bar.
 
+mod achievements;
 mod config;
 mod db;
 mod devices;
@@ -8,8 +9,10 @@ mod firmware;
 mod game;
 mod input;
 mod ipc;
+mod notify;
 mod stats;
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -48,6 +51,59 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
+    /// Maintainer tools for the encrypted achievement definitions.
+    #[command(hide = true)]
+    Dev {
+        #[command(subcommand)]
+        action: DevAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DevAction {
+    /// JSON definitions → achievements.enc
+    Encrypt { input: PathBuf, output: PathBuf },
+    /// achievements.enc → JSON definitions (spoilers!)
+    Decrypt { input: PathBuf, output: PathBuf },
+    /// Validate an encrypted file and print counts only (no names).
+    Check { input: PathBuf },
+}
+
+fn dev(action: DevAction) -> Result<()> {
+    match action {
+        DevAction::Encrypt { input, output } => {
+            let json = std::fs::read(&input)?;
+            let defs: Vec<achievements::Definition> = serde_json::from_slice(&json)?;
+            std::fs::write(&output, achievements::crypt(&serde_json::to_vec(&defs)?))?;
+            println!("encrypted {} definitions", defs.len());
+        }
+        DevAction::Decrypt { input, output } => {
+            let defs = achievements::parse(&std::fs::read(&input)?)?;
+            std::fs::write(&output, serde_json::to_vec_pretty(&defs)?)?;
+            println!("decrypted {} definitions", defs.len());
+        }
+        DevAction::Check { input } => {
+            let defs = achievements::parse(&std::fs::read(&input)?)?;
+            let mut by_rarity = std::collections::BTreeMap::new();
+            let mut ids = std::collections::HashSet::new();
+            for d in &defs {
+                *by_rarity.entry(format!("{:?}", d.rarity)).or_insert(0) += 1;
+                anyhow::ensure!(ids.insert(&d.id), "duplicate id {}", d.id);
+                anyhow::ensure!(!d.all.is_empty(), "{} has no requirements", d.id);
+                for r in &d.all {
+                    anyhow::ensure!(
+                        achievements::is_known_metric(&r.metric),
+                        "{}: unknown metric {}",
+                        d.id,
+                        r.metric
+                    );
+                }
+            }
+            let secret = defs.iter().filter(|d| d.secret).count();
+            println!("{} definitions, {secret} secret, {by_rarity:?}", defs.len());
+        }
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -67,6 +123,7 @@ fn main() -> Result<()> {
         }
         Command::Pick => pick(),
         Command::Status { watch } => status(watch),
+        Command::Dev { action } => dev(action),
     }
 }
 
