@@ -72,7 +72,14 @@ Läuft auf der Central-Hälfte.
 - Pakete werden gebündelt → wenig Funkverkehr, geringer Akkuverbrauch.
 
 ### 3.3 Risiken (→ Spike, Phase 0)
-- Kommt der Vendor-HID-Kanal **über BLE unter Windows** an? Undokumentiert.
+- ~~Kommt der Vendor-HID-Kanal **über BLE unter Windows** an?~~ **Ja (2026-11-20, Cornix, Windows 11):**
+  USB und Bluetooth liefern Layer + Akku beider Hälften, Layerwechsel sofort, keine Lücken.
+  Nach dem Firmware-Update musste Bluetooth neu gekoppelt werden (Windows cached die GATT-Dienste).
+- Erkenntnisse für Phase 3:
+  - Peripheral-Akku ist `0`, solange ZMK noch keinen Wert hat (auch wenn die Hälfte nicht verbunden ist)
+    → Firmware muss „unbekannt“ (`0xFF`) senden, bis ein Batterie-Event kam.
+  - Layer-Bitmaske enthält Layer 0 nie → Host behandelt Base als immer aktiv.
+  - Ob `SYNC` über BLE ankommt, ist noch nicht belegt (Heartbeat überdeckt es).
 - HRM-Erkennung: ZMK hat kein öffentliches Hold-Tap-Event → Korrelation muss im Spike bewiesen werden.
 - Combo-Erkennung: Reihenfolge der Listener prüfen.
 - Kompatibilität mit dem Zephyr-Stand des Cornix-Boards.
