@@ -76,7 +76,9 @@ pub fn decode(data: &[u8]) -> Result<Message, DecodeError> {
         MSG_KEYSTATS => {
             let n = (data[4] as usize).min((data.len() - 5) / 2);
             let presses = data[5..5 + 2 * n]
-                .as_chunks::<2>().0.iter()
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| (c[0], c[1]))
                 .collect();
             Ok(Message::KeyStats { seq, presses })
@@ -84,7 +86,9 @@ pub fn decode(data: &[u8]) -> Result<Message, DecodeError> {
         MSG_HOLDTAP => {
             let n = (data[4] as usize).min((data.len() - 5) / 3);
             let outcomes = data[5..5 + 3 * n]
-                .as_chunks::<3>().0.iter()
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|c| (c[0], c[1], c[2]))
                 .collect();
             Ok(Message::HoldTap { seq, outcomes })

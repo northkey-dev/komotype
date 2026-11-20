@@ -51,6 +51,8 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
+    /// Show a test notification.
+    NotifyTest,
     /// Maintainer tools for the encrypted achievement definitions.
     #[command(hide = true)]
     Dev {
@@ -106,17 +108,49 @@ fn dev(action: DevAction) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "komotyped=info".into()),
-        )
-        .with_target(false)
-        .init();
+/// Log file of the daemon. It usually runs without a console (started by the bar).
+fn log_file() -> Option<std::fs::File> {
+    const MAX_BYTES: u64 = 2 * 1024 * 1024;
+    let dir = config::data_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("komotyped.log");
+    let too_big = std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(!too_big)
+        .write(true)
+        .truncate(too_big)
+        .open(path)
+        .ok()
+}
 
-    match Cli::parse().command.unwrap_or(Command::Run) {
+fn main() -> Result<()> {
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+
+    let command = Cli::parse().command.unwrap_or(Command::Run);
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "komotyped=info".into());
+    match (&command, log_file()) {
+        (Command::Run, Some(file)) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(std::io::stderr.and(std::sync::Mutex::new(file)))
+            .init(),
+        _ => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .init(),
+    }
+
+    match command {
         Command::Run => run(),
+        Command::NotifyTest => {
+            notify::show("komotype".into(), "Notifications work.".into());
+            // The toast is shown from a background thread.
+            std::thread::sleep(Duration::from_secs(2));
+            Ok(())
+        }
         Command::Devices => {
             list_devices();
             Ok(())

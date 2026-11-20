@@ -8,7 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use chrono::{Datelike, Local, NaiveDate, TimeZone, Timelike};
 use komotype_protocol::ipc::{
-    Command, FirmwareState, GameEventKind, IPC_VERSION, KeyStats, Status, Transport, Typing,
+    Command, FirmwareState, GameEventKind, IPC_VERSION, KeyStats, Keyboard, Status, Transport,
+    Typing,
 };
 use komotype_protocol::raw_hid::Message;
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,7 @@ use crate::achievements::{self, Book, Snapshot};
 
 use crate::config::{self, Config};
 use crate::db::{Db, MinuteCounts};
-use crate::devices::{self, DeviceInfo};
+use crate::devices::{self, DeviceInfo, DeviceMatcher};
 use crate::game::{Baseline, DaySummary, DayView, Game, GameState};
 use crate::input::{DeviceHandle, InputEvent};
 use crate::notify;
@@ -123,6 +124,8 @@ pub struct Engine {
     last_burst: LastBurst,
     /// Game events up to this time were already considered for notifications.
     last_toast_ms: i64,
+    /// The next key press chooses the main keyboard.
+    picking: bool,
     wpm_7d: Option<f32>,
     rival_wpm_7d: Option<f32>,
     pending_minutes: HashMap<(i64, i64), MinuteCounts>,
@@ -202,6 +205,7 @@ impl Engine {
             extra,
             last_burst: LastBurst::default(),
             last_toast_ms: now_ms(),
+            picking: false,
             wpm_7d: None,
             rival_wpm_7d: None,
             pending_minutes: HashMap::new(),
@@ -288,6 +292,21 @@ impl Engine {
                 self.on_firmware_stats(message);
                 Ok(())
             }
+            Event::Command(Command::SetMain { vid, pid, product }) => {
+                self.set_main(DeviceMatcher { vid, pid, product })?;
+                self.publish();
+                Ok(())
+            }
+            Event::Command(Command::PickNext) => {
+                self.picking = true;
+                self.publish();
+                Ok(())
+            }
+            Event::Command(Command::CancelPick) => {
+                self.picking = false;
+                self.publish();
+                Ok(())
+            }
             Event::Command(Command::Prestige) => {
                 if self.game.prestige(now_ms()) {
                     info!("prestige");
@@ -372,6 +391,17 @@ impl Engine {
                 return Ok(());
             };
             self.register(device, info)?;
+        }
+        if self.picking
+            && let Some(matcher) = DeviceMatcher::from_info(&self.known[&device].info)
+        {
+            self.picking = false;
+            info!(
+                name = self.known[&device].info.display_name(),
+                "main keyboard picked"
+            );
+            self.set_main(matcher)?;
+            self.publish();
         }
         let known = &self.known[&device];
         let (db_id, is_main, identified) = (known.db_id, known.is_main, known.info.vid.is_some());
@@ -550,6 +580,33 @@ impl Engine {
             self.publish();
         }
         Ok(())
+    }
+
+    /// Saves a new main keyboard to the config file and applies it.
+    fn set_main(&mut self, matcher: DeviceMatcher) -> Result<()> {
+        self.config.main = Some(matcher);
+        config::save(&self.config)?;
+        self.config_mtime = config::modified();
+        self.apply_config()
+    }
+
+    fn keyboards(&self) -> Vec<Keyboard> {
+        let mut seen = HashSet::new();
+        let mut list: Vec<Keyboard> = self
+            .attached
+            .iter()
+            .filter_map(|h| self.known.get(h))
+            .filter(|k| seen.insert((k.info.key(), k.info.transport)))
+            .map(|k| Keyboard {
+                name: k.info.display_name(),
+                vid: k.info.vid,
+                pid: k.info.pid,
+                transport: k.info.transport,
+                main: k.is_main,
+            })
+            .collect();
+        list.sort_by(|a, b| b.main.cmp(&a.main).then(a.name.cmp(&b.name)));
+        list
     }
 
     fn apply_config(&mut self) -> Result<()> {
@@ -918,7 +975,7 @@ impl Engine {
                 _ => None,
             };
             if let Some((title, body)) = toast {
-                notify::show(format!("komotype · {title}"), body);
+                notify::show(title, body);
             }
         }
     }
@@ -975,6 +1032,8 @@ impl Engine {
                 holds: day.positions.iter().map(|p| p[2]).collect(),
             }),
             achievements: self.main_db_id.map(|_| self.book.view()),
+            keyboards: self.keyboards(),
+            picking: self.picking,
         };
         self.status_tx.send_if_modified(|current| {
             if *current == status {

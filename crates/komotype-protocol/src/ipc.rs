@@ -11,7 +11,7 @@ use crate::raw_hid::KeyboardReport;
 pub const PIPE_NAME: &str = r"\\.\pipe\komotype";
 
 /// Bumped on breaking changes to [`Status`].
-pub const IPC_VERSION: u32 = 3;
+pub const IPC_VERSION: u32 = 4;
 
 /// Client → daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -19,6 +19,25 @@ pub const IPC_VERSION: u32 = 3;
 pub enum Command {
     /// Reset the level to 1 in exchange for a prestige star. Only allowed at the maximum level.
     Prestige,
+    /// Make this keyboard the main keyboard.
+    SetMain {
+        vid: u16,
+        pid: u16,
+        product: Option<String>,
+    },
+    /// The next key press decides the main keyboard.
+    PickNext,
+    CancelPick,
+}
+
+/// An attached keyboard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Keyboard {
+    pub name: String,
+    pub vid: Option<u16>,
+    pub pid: Option<u16>,
+    pub transport: Transport,
+    pub main: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -39,6 +58,10 @@ pub struct Status {
     pub key_stats: Option<KeyStats>,
     /// Achievements, `None` until a main keyboard is configured.
     pub achievements: Option<Achievements>,
+    /// Attached keyboards, for choosing the main one.
+    pub keyboards: Vec<Keyboard>,
+    /// Waiting for a key press to choose the main keyboard ([`Command::PickNext`]).
+    pub picking: bool,
 }
 
 /// Counts per physical key position (index = position in the keymap).
